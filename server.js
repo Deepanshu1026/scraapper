@@ -67,7 +67,7 @@ app.get("/scrape", async (req, res) => {
     let previousCount = 0;
     let noNewCount = 0;
 
-    while (noNewCount < 10) {
+    while (noNewCount < 5) {
       const currentCount = await page.evaluate(() => document.querySelectorAll('a.hfpxzc').length);
       console.log(`[SCRAPE] Loaded ${currentCount} listings...`);
       if (currentCount >= totalNeeded) break;
@@ -108,21 +108,20 @@ app.get("/scrape", async (req, res) => {
       console.log(`[SCRAPE] [${finalResults.length + 1}/${limit}] Clicking: ${listing.name}`);
 
       try {
-        // IMPORTANT: Find the link FRESH each time using page.evaluate + click
-        // This avoids the "Node is detached" error completely
-        const clicked = await page.evaluate((targetName) => {
-          const links = document.querySelectorAll('a.hfpxzc');
-          for (const link of links) {
-            if (link.getAttribute('aria-label') === targetName) {
-              link.scrollIntoView({ block: "center" });
-              link.click();
-              return true;
-            }
+        // Get FRESH element handles each time (prevents stale nodes)
+        const links = await page.$$('a.hfpxzc');
+        
+        // Find the matching link by aria-label
+        let targetLink = null;
+        for (const link of links) {
+          const label = await link.evaluate(el => el.getAttribute('aria-label'));
+          if (label === listing.name) {
+            targetLink = link;
+            break;
           }
-          return false;
-        }, listing.name);
+        }
 
-        if (!clicked) {
+        if (!targetLink) {
           console.log(`[SCRAPE] Could not find link for: ${listing.name}, skipping`);
           finalResults.push({
             name: listing.name, rating: '', reviews: '', phone: '',
@@ -131,15 +130,19 @@ app.get("/scrape", async (req, res) => {
           continue;
         }
 
+        // Scroll into view and use PUPPETEER'S real click (not page.evaluate synthetic click)
+        await targetLink.evaluate(el => el.scrollIntoView({ block: "center" }));
+        await new Promise(r => setTimeout(r, 300));
+        await targetLink.click(); // Real mouse event that Google Maps responds to!
+
         // Wait for the detail panel to load (h1 changes to business name)
         try {
-          await page.waitForFunction((expectedName) => {
+          await page.waitForFunction(() => {
             const h1 = document.querySelector('h1');
             if (!h1) return false;
             const text = h1.innerText.trim();
-            // h1 should not be empty and should not be "Results"
             return text.length > 0 && text !== 'Results';
-          }, { timeout: 10000 }, listing.name);
+          }, { timeout: 10000 });
         } catch (e) {
           console.log(`[SCRAPE] Detail panel slow for: ${listing.name}`);
         }
@@ -226,43 +229,33 @@ app.get("/scrape", async (req, res) => {
 
         console.log(`[SCRAPE] ✅ ${data.name} | ⭐${data.rating} | 📞${data.phone} | 🌐${data.website ? 'yes' : 'no'}`);
 
-        // Go back to search results using the Maps back button
-        // Use page.evaluate to click the back button in the Maps UI
-        const wentBack = await page.evaluate(() => {
-          // Try the Maps UI back button first
-          const backBtn = document.querySelector('button[aria-label="Back"]');
-          if (backBtn) { backBtn.click(); return 'button'; }
-          return false;
-        });
-
-        if (wentBack) {
-          // Wait for the feed to reappear
-          try {
-            await page.waitForFunction(() => {
-              return document.querySelectorAll('a.hfpxzc').length > 0;
-            }, { timeout: 10000 });
-          } catch (e) {
-            // If back button didn't work, try browser back
-            await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-            await new Promise(r => setTimeout(r, 3000));
+        // Go back to search results
+        // First try the Maps UI back button (real Puppeteer click)
+        let wentBack = false;
+        try {
+          const backBtn = await page.$('button[aria-label="Back"]');
+          if (backBtn) {
+            await backBtn.click(); // Real Puppeteer click
+            wentBack = true;
           }
-        } else {
-          // Fallback: browser back
+        } catch (e) {}
+
+        if (!wentBack) {
           await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-          await new Promise(r => setTimeout(r, 3000));
         }
 
-        // Wait for listings to be visible again
+        // Wait for ALL listings to be visible again (not just 1)
+        const expectedCount = allListings.length;
         try {
-          await page.waitForFunction(() => {
-            return document.querySelectorAll('a.hfpxzc').length > 0;
-          }, { timeout: 10000 });
+          await page.waitForFunction((expected) => {
+            return document.querySelectorAll('a.hfpxzc').length >= Math.min(expected, 3);
+          }, { timeout: 15000 }, expectedCount);
         } catch (e) {
           console.log("[SCRAPE] Feed slow to reappear, waiting more...");
           await new Promise(r => setTimeout(r, 5000));
         }
 
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 1000));
 
       } catch (err) {
         console.log(`[SCRAPE] ❌ Error for ${listing.name}: ${err.message}`);
