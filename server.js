@@ -9,6 +9,68 @@ app.get("/", (req, res) => {
   res.json({ status: "Scraper API is running!" });
 });
 
+// ===== Helper: Extract data from a place detail page =====
+async function extractPlaceData(page) {
+  const data = await page.evaluate(() => {
+    const clean = (text) => text.replace(/[^\x20-\x7E]/g, "").trim();
+    const getText = (sel) => clean(document.querySelector(sel)?.innerText || "");
+    const getHref = (sel) => document.querySelector(sel)?.href || "";
+
+    return {
+      name: getText("h1"),
+      rating: getText('div[role="img"]'),
+      reviews: getText(".F7nice"),
+      address: getText('button[data-item-id="address"]'),
+      phone: getText('button[data-item-id*="phone"]'),
+      website: getHref('a[data-item-id="authority"]'),
+      google_link: window.location.href
+    };
+  });
+  return data;
+}
+
+// ===== Helper: Visit a place URL and extract data (with 1 retry) =====
+async function visitAndExtract(page, listing) {
+  // Try up to 2 times
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      await page.goto(listing.url, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+      // Wait for the info section (phone/address/website buttons)
+      // This is the signal that the page is actually ready
+      await page.waitForFunction(() => {
+        const btns = document.querySelectorAll('button[data-item-id], a[data-item-id]');
+        return btns.length > 0;
+      }, { timeout: 20000 });
+
+      // Small buffer
+      await new Promise(r => setTimeout(r, 800));
+
+      const data = await extractPlaceData(page);
+
+      // Verify we got real data (not "Results" or empty)
+      if (data.name && data.name !== 'Results' && data.name !== 'Sponsored') {
+        return data;
+      }
+
+      // If name is wrong, wait a bit more and retry extraction
+      await new Promise(r => setTimeout(r, 3000));
+      const data2 = await extractPlaceData(page);
+      if (data2.name && data2.name !== 'Results') return data2;
+
+      // Use what we have
+      return data;
+
+    } catch (err) {
+      if (attempt === 1) {
+        console.log(`[SCRAPE] Attempt 1 failed, retrying: ${listing.name}`);
+        continue; // Retry
+      }
+      throw err; // Give up after 2 attempts
+    }
+  }
+}
+
 app.get("/scrape", async (req, res) => {
   const query = req.query.q;
   const limit = parseInt(req.query.limit) || 10;
@@ -24,10 +86,10 @@ app.get("/scrape", async (req, res) => {
   try {
     browser = await puppeteer.launch({
       headless: "new",
-      defaultViewport: null,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
         "--window-size=1920,1080"
       ]
     });
@@ -35,11 +97,14 @@ app.get("/scrape", async (req, res) => {
     const page = await browser.newPage();
     await page.setViewport({ width: 1920, height: 1080 });
 
-    // Block heavy resources to make page loads 3x faster
+    // Real Chrome user agent to avoid detection
+    await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36");
+
+    // Block ONLY images and media (keep CSS + JS + fonts — Maps needs them!)
     await page.setRequestInterception(true);
     page.on('request', (req) => {
       const type = req.resourceType();
-      if (['image', 'font', 'media', 'stylesheet'].includes(type)) {
+      if (['image', 'media'].includes(type)) {
         req.abort();
       } else {
         req.continue();
@@ -53,7 +118,6 @@ app.get("/scrape", async (req, res) => {
       timeout: 60000
     });
 
-    // Let JS render
     await new Promise(r => setTimeout(r, 8000));
 
     // Handle consent
@@ -77,7 +141,7 @@ app.get("/scrape", async (req, res) => {
     let prev = 0, noNew = 0;
     while (noNew < 5) {
       const count = await page.evaluate(() => document.querySelectorAll('a.hfpxzc').length);
-      console.log(`[SCRAPE] Loaded ${count} listings...`);
+      console.log(`[SCRAPE] Loaded ${count} listings`);
       if (count >= totalNeeded) break;
       if (count === prev) noNew++; else noNew = 0;
       prev = count;
@@ -95,48 +159,21 @@ app.get("/scrape", async (req, res) => {
 
     console.log(`[SCRAPE] Found ${allListings.length} listings`);
 
-    // ===== STEP 4: Visit each URL (the approach that WORKS) =====
+    // ===== STEP 4: Visit each place URL and extract data =====
     const start = skip;
     const end = Math.min(skip + limit, allListings.length);
     const results = [];
 
     for (let i = start; i < end; i++) {
       const listing = allListings[i];
-      console.log(`[SCRAPE] [${results.length + 1}/${limit}] Visiting: ${listing.name}`);
+      console.log(`[SCRAPE] [${results.length + 1}/${end - start}] ${listing.name}`);
 
       try {
-        await page.goto(listing.url, { waitUntil: "domcontentloaded", timeout: 40000 });
-
-        // Wait for info section to load (the REAL data)
-        await page.waitForFunction(() => {
-          const btns = document.querySelectorAll('button[data-item-id], a[data-item-id]');
-          return btns.length > 0;
-        }, { timeout: 15000 }).catch(() => {});
-
-        await new Promise(r => setTimeout(r, 1000));
-
-        // Extract using YOUR EXACT local selectors
-        const data = await page.evaluate(() => {
-          const clean = (text) => text.replace(/[^\x20-\x7E]/g, "").trim();
-          const getText = (sel) => clean(document.querySelector(sel)?.innerText || "");
-          const getHref = (sel) => document.querySelector(sel)?.href || "";
-
-          return {
-            name: getText("h1"),
-            rating: getText('div[role="img"]'),
-            reviews: getText(".F7nice"),
-            address: getText('button[data-item-id="address"]'),
-            phone: getText('button[data-item-id*="phone"]'),
-            website: getHref('a[data-item-id="authority"]'),
-            google_link: window.location.href
-          };
-        });
-
+        const data = await visitAndExtract(page, listing);
         results.push(data);
         console.log(`[SCRAPE] ✅ ${data.name} | ${data.rating} | 📞${data.phone}`);
-
       } catch (err) {
-        console.log(`[SCRAPE] ⏭️ Skipped ${listing.name} (timeout)`);
+        console.log(`[SCRAPE] ⏭️ Skipped: ${listing.name}`);
         results.push({
           name: listing.name, rating: '', reviews: '', phone: '',
           website: '', address: '', google_link: listing.url
@@ -144,7 +181,7 @@ app.get("/scrape", async (req, res) => {
       }
     }
 
-    console.log(`[SCRAPE] DONE! ${results.length} results.`);
+    console.log(`[SCRAPE] DONE! ${results.length} results`);
     await browser.close();
     res.json(results);
 
