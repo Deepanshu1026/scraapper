@@ -1,5 +1,6 @@
 const express = require("express");
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-core");
+const chromium = require("@sparticuz/chromium");
 const cors = require("cors");
 
 const app = express();
@@ -12,7 +13,7 @@ app.get("/", (req, res) => {
 
 app.get("/scrape", async (req, res) => {
   const query = req.query.q;
-  const limit = parseInt(req.query.limit) || 10; // Default limit to avoid Render timeouts
+  const limit = parseInt(req.query.limit) || 10;
   
   if (!query) {
     return res.status(400).json({ error: "Please provide a query parameter 'q'" });
@@ -20,17 +21,14 @@ app.get("/scrape", async (req, res) => {
 
   console.log(`Starting scrape for: ${query} (limit: ${limit})`);
   
-  // To avoid Puppeteer hanging on Render, use these args
   let browser;
   try {
     browser = await puppeteer.launch({
-      headless: true, // MUST be true for Render
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu"
-      ]
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true,
     });
 
     const page = await browser.newPage();
