@@ -25,7 +25,7 @@ app.get("/scrape", async (req, res) => {
   try {
     browser = await puppeteer.launch({
       args: chromium.args,
-      defaultViewport: chromium.defaultViewport,
+      defaultViewport: { width: 1920, height: 1080 },
       executablePath: await chromium.executablePath(),
       headless: chromium.headless,
       ignoreHTTPSErrors: true,
@@ -39,8 +39,22 @@ app.get("/scrape", async (req, res) => {
       timeout: 60000 // 60 seconds
     });
 
+    // Accept Google's cookie consent if it appears (common on serverless IPs)
+    try {
+      const consentButton = await page.$('button[aria-label="Accept all"]');
+      if (consentButton) {
+        await consentButton.click();
+        await new Promise(r => setTimeout(r, 2000));
+      }
+    } catch (e) {}
+
     // Wait longer for the search results to appear since Render is slow
-    await page.waitForSelector('div[role="feed"]', { timeout: 45000 });
+    try {
+      await page.waitForSelector('div[role="feed"]', { timeout: 45000 });
+    } catch (err) {
+      const pageTitle = await page.title();
+      throw new Error(`Could not find the results list. Page Title was: "${pageTitle}". Make sure your search query is broad enough to return a list, not just a single place. If it's a captcha, Google blocked the server IP.`);
+    }
 
     const processed = new Set();
     const results = [];
