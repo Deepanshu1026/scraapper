@@ -31,6 +31,17 @@ app.get("/scrape", async (req, res) => {
     await page.setViewport({ width: 1920, height: 1080 });
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
+    // Abort images, fonts, stylesheets to speed up loading
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      const type = req.resourceType();
+      if (['image', 'font', 'media'].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
     // ===== STEP 1: Navigate to Google Maps search =====
     console.log("[SCRAPE] Navigating to Google Maps...");
     await page.goto(`https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`, {
@@ -38,10 +49,9 @@ app.get("/scrape", async (req, res) => {
       timeout: 60000
     });
 
-    // Give Maps JS time to render
     await new Promise(r => setTimeout(r, 8000));
 
-    // Handle consent screen
+    // Handle consent
     try {
       for (const sel of ['button[aria-label="Accept all"]', 'button[aria-label="Reject all"]', 'form[action*="consent"] button']) {
         const btn = await page.$(sel);
@@ -49,17 +59,15 @@ app.get("/scrape", async (req, res) => {
       }
     } catch (e) {}
 
-    // Wait for listings to appear
+    // Wait for listings
     console.log("[SCRAPE] Waiting for listings...");
     try {
       await page.waitForFunction(() => {
-        return document.querySelectorAll('div.Nv2PK').length > 0
-            || document.querySelectorAll('a.hfpxzc').length > 0;
+        return document.querySelectorAll('a.hfpxzc').length > 0;
       }, { timeout: 60000 });
       console.log("[SCRAPE] Listings found!");
     } catch (err) {
-      const title = await page.title();
-      throw new Error(`No listings found. Page: "${title}"`);
+      throw new Error(`No listings found. Page: "${await page.title()}"`);
     }
 
     // ===== STEP 2: Scroll to load enough listings =====
@@ -82,7 +90,7 @@ app.get("/scrape", async (req, res) => {
       await new Promise(r => setTimeout(r, 2000));
     }
 
-    // ===== STEP 3: Collect listing names from cards =====
+    // ===== STEP 3: Collect listing names + URLs =====
     const allListings = await page.evaluate(() => {
       const links = document.querySelectorAll('a.hfpxzc');
       const results = [];
@@ -96,7 +104,7 @@ app.get("/scrape", async (req, res) => {
 
     console.log(`[SCRAPE] Found ${allListings.length} listings in feed`);
 
-    // ===== STEP 4: Click each listing to get details (FAST - no page reload!) =====
+    // ===== STEP 4: Visit each place URL directly =====
     const startIndex = skip;
     const endIndex = Math.min(skip + limit, allListings.length);
     const finalResults = [];
@@ -105,66 +113,33 @@ app.get("/scrape", async (req, res) => {
       const listing = allListings[i];
       if (!listing) continue;
 
-      console.log(`[SCRAPE] [${finalResults.length + 1}/${limit}] Clicking: ${listing.name}`);
+      console.log(`[SCRAPE] [${finalResults.length + 1}/${limit}] Visiting: ${listing.name}`);
 
       try {
-        // Get FRESH element handles each time (prevents stale nodes)
-        const links = await page.$$('a.hfpxzc');
-        
-        // Find the matching link by aria-label
-        let targetLink = null;
-        for (const link of links) {
-          const label = await link.evaluate(el => el.getAttribute('aria-label'));
-          if (label === listing.name) {
-            targetLink = link;
-            break;
-          }
-        }
+        // Navigate to the place URL with a SHORT timeout
+        // If it doesn't load in 20s, we skip it fast instead of waiting 45s
+        await page.goto(listing.url, {
+          waitUntil: "domcontentloaded",
+          timeout: 20000
+        });
 
-        if (!targetLink) {
-          console.log(`[SCRAPE] Could not find link for: ${listing.name}, skipping`);
-          finalResults.push({
-            name: listing.name, rating: '', reviews: '', phone: '',
-            website: '', address: '', google_link: listing.url
-          });
-          continue;
-        }
+        // Wait for h1 (business name)
+        await page.waitForFunction(() => {
+          const h1 = document.querySelector('h1');
+          return h1 && h1.innerText.trim().length > 0 && h1.innerText.trim() !== 'Results';
+        }, { timeout: 8000 }).catch(() => {});
 
-        // Scroll into view and use PUPPETEER'S real click (not page.evaluate synthetic click)
-        await targetLink.evaluate(el => el.scrollIntoView({ block: "center" }));
-        await new Promise(r => setTimeout(r, 300));
-        await targetLink.click(); // Real mouse event that Google Maps responds to!
+        // Wait for info section (phone/address/website buttons)
+        await page.waitForFunction(() => {
+          return document.querySelectorAll('button[data-item-id], a[data-item-id]').length > 0;
+        }, { timeout: 8000 }).catch(() => {});
 
-        // Wait for the detail panel to load (h1 changes to business name)
-        try {
-          await page.waitForFunction(() => {
-            const h1 = document.querySelector('h1');
-            if (!h1) return false;
-            const text = h1.innerText.trim();
-            return text.length > 0 && text !== 'Results';
-          }, { timeout: 10000 });
-        } catch (e) {
-          console.log(`[SCRAPE] Detail panel slow for: ${listing.name}`);
-        }
-
-        // Wait for info buttons (phone/address/website) to appear
-        try {
-          await page.waitForFunction(() => {
-            const btns = document.querySelectorAll('button[data-item-id], a[data-item-id]');
-            return btns.length > 0;
-          }, { timeout: 10000 });
-        } catch (e) {
-          console.log(`[SCRAPE] No info buttons for: ${listing.name}`);
-        }
-
-        // Small buffer for remaining elements
         await new Promise(r => setTimeout(r, 1000));
 
-        // Extract ALL data from the detail panel
+        // Extract data
         const data = await page.evaluate(() => {
           const clean = (text) => text ? text.replace(/[^\x20-\x7E]/g, "").trim() : "";
 
-          // Name
           const h1 = document.querySelector('h1');
           const name = h1 ? clean(h1.innerText) : '';
 
@@ -172,13 +147,6 @@ app.get("/scrape", async (req, res) => {
           let rating = '';
           const ratingSpan = document.querySelector('div.F7nice span[aria-hidden="true"]');
           if (ratingSpan) rating = clean(ratingSpan.innerText);
-          if (!rating) {
-            const roleImg = document.querySelector('div[role="img"][aria-label*="star"]');
-            if (roleImg) {
-              const m = (roleImg.getAttribute('aria-label') || '').match(/([\d.]+)/);
-              if (m) rating = m[1];
-            }
-          }
           if (!rating) {
             for (const s of document.querySelectorAll('span')) {
               if (/^\d\.\d$/.test(s.innerText.trim())) { rating = s.innerText.trim(); break; }
@@ -196,21 +164,17 @@ app.get("/scrape", async (req, res) => {
             for (const el of document.querySelectorAll('div.F7nice span')) {
               const t = el.innerText.trim();
               if (/^\(?\d/.test(t) && !/^\d\.\d$/.test(t)) {
-                reviews = t.replace(/[()]/g, '').trim();
-                break;
+                reviews = t.replace(/[()]/g, '').trim(); break;
               }
             }
           }
 
-          // Phone
           const phoneBtn = document.querySelector('button[data-item-id*="phone"]');
           const phone = phoneBtn ? clean(phoneBtn.innerText) : '';
 
-          // Website
           const websiteLink = document.querySelector('a[data-item-id="authority"]');
           const website = websiteLink ? websiteLink.href : '';
 
-          // Address
           const addressBtn = document.querySelector('button[data-item-id="address"]');
           const address = addressBtn ? clean(addressBtn.innerText) : '';
 
@@ -229,46 +193,13 @@ app.get("/scrape", async (req, res) => {
 
         console.log(`[SCRAPE] ✅ ${data.name} | ⭐${data.rating} | 📞${data.phone} | 🌐${data.website ? 'yes' : 'no'}`);
 
-        // Go back to search results
-        // First try the Maps UI back button (real Puppeteer click)
-        let wentBack = false;
-        try {
-          const backBtn = await page.$('button[aria-label="Back"]');
-          if (backBtn) {
-            await backBtn.click(); // Real Puppeteer click
-            wentBack = true;
-          }
-        } catch (e) {}
-
-        if (!wentBack) {
-          await page.goBack({ waitUntil: "domcontentloaded", timeout: 15000 }).catch(() => {});
-        }
-
-        // Wait for ALL listings to be visible again (not just 1)
-        const expectedCount = allListings.length;
-        try {
-          await page.waitForFunction((expected) => {
-            return document.querySelectorAll('a.hfpxzc').length >= Math.min(expected, 3);
-          }, { timeout: 15000 }, expectedCount);
-        } catch (e) {
-          console.log("[SCRAPE] Feed slow to reappear, waiting more...");
-          await new Promise(r => setTimeout(r, 5000));
-        }
-
-        await new Promise(r => setTimeout(r, 1000));
-
       } catch (err) {
-        console.log(`[SCRAPE] ❌ Error for ${listing.name}: ${err.message}`);
+        console.log(`[SCRAPE] ⏭️ Skipped ${listing.name} (${err.message.substring(0, 40)})`);
+        // Add with whatever we have
         finalResults.push({
           name: listing.name, rating: '', reviews: '', phone: '',
           website: '', address: '', google_link: listing.url
         });
-
-        // Try to recover
-        try {
-          await page.goBack({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => {});
-          await new Promise(r => setTimeout(r, 3000));
-        } catch (e) {}
       }
     }
 
