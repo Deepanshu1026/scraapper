@@ -170,21 +170,35 @@ app.get("/scrape", async (req, res) => {
         // Navigate directly to the place URL
         await page.goto(listing.url, {
           waitUntil: "domcontentloaded",
-          timeout: 30000
+          timeout: 45000
         });
 
-        // Wait for the place details to load (h1 with the business name)
+        // STEP A: Wait for the h1 business name to appear first
         try {
           await page.waitForFunction(() => {
             const h1 = document.querySelector('h1');
             return h1 && h1.innerText.trim().length > 0 && h1.innerText.trim() !== 'Results';
-          }, { timeout: 10000 });
+          }, { timeout: 15000 });
         } catch (e) {
-          console.log(`[SCRAPE] Slow load for: ${listing.name}`);
+          console.log(`[SCRAPE] h1 slow for: ${listing.name}`);
         }
 
-        // Extra wait for all info buttons to render
-        await new Promise(r => setTimeout(r, 2000));
+        // STEP B: Now wait specifically for the INFO SECTION to load
+        // The address/phone/website buttons load AFTER h1 via AJAX
+        // This is the critical wait that was missing before
+        try {
+          await page.waitForFunction(() => {
+            // Check if any data-item-id buttons exist (address, phone, website, etc.)
+            const infoButtons = document.querySelectorAll('button[data-item-id], a[data-item-id]');
+            return infoButtons.length > 0;
+          }, { timeout: 15000 });
+          console.log(`[SCRAPE] Info section loaded for: ${listing.name}`);
+        } catch (e) {
+          console.log(`[SCRAPE] Info section not found for: ${listing.name} (may be a location, not a business)`);
+        }
+
+        // Small extra buffer for remaining elements to render
+        await new Promise(r => setTimeout(r, 1500));
 
         // Extract ALL data from the place detail page
         const data = await page.evaluate(() => {
