@@ -33,13 +33,14 @@ app.get("/scrape", async (req, res) => {
 
     const page = await browser.newPage();
     
-    // Set a timeout for the navigation
+    // Set a timeout for the navigation. Use domcontentloaded because Maps is too heavy for networkidle2 on free tier
     await page.goto(`https://www.google.com/maps/search/${encodeURIComponent(query)}`, {
-      waitUntil: "networkidle2",
+      waitUntil: "domcontentloaded",
       timeout: 60000 // 60 seconds
     });
 
-    await page.waitForSelector('div[role="feed"]', { timeout: 10000 });
+    // Wait longer for the search results to appear since Render is slow
+    await page.waitForSelector('div[role="feed"]', { timeout: 45000 });
 
     const processed = new Set();
     const results = [];
