@@ -22,190 +22,158 @@ app.get("/scrape", async (req, res) => {
 
   let browser;
   try {
+    // ===== LAUNCH CHROME - as close to local as possible =====
     browser = await puppeteer.launch({
-      headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process"]
+      headless: "new",          // NEW headless = behaves exactly like real Chrome (not old headless)
+      defaultViewport: null,    // Same as local script
+      args: [
+        "--no-sandbox",         // Required on Linux/Render
+        "--disable-setuid-sandbox",
+        "--window-size=1920,1080"
+      ]
     });
 
     const page = await browser.newPage();
-    await page.setViewport({ width: 1920, height: 1080 });
-    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-US,en;q=0.9' });
 
-    // Abort images, fonts, stylesheets to speed up loading
-    await page.setRequestInterception(true);
-    page.on('request', (req) => {
-      const type = req.resourceType();
-      if (['image', 'font', 'media'].includes(type)) {
-        req.abort();
-      } else {
-        req.continue();
-      }
+    // ===== EXACT SAME FLOW AS YOUR LOCAL scrappper.js =====
+
+    console.log("[SCRAPE] Opening Maps...");
+    await page.goto(`https://www.google.com/maps/search/${encodeURIComponent(query)}`, {
+      waitUntil: "networkidle2",
+      timeout: 120000   // 2 min timeout (Render is slow, but let it finish)
     });
 
-    // ===== STEP 1: Navigate to Google Maps search =====
-    console.log("[SCRAPE] Navigating to Google Maps...");
-    await page.goto(`https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`, {
-      waitUntil: "domcontentloaded",
-      timeout: 60000
-    });
-
-    await new Promise(r => setTimeout(r, 8000));
-
-    // Handle consent
+    // Handle consent if it shows up
     try {
-      for (const sel of ['button[aria-label="Accept all"]', 'button[aria-label="Reject all"]', 'form[action*="consent"] button']) {
+      for (const sel of ['button[aria-label="Accept all"]', 'button[aria-label="Reject all"]']) {
         const btn = await page.$(sel);
         if (btn) { await btn.click(); await new Promise(r => setTimeout(r, 3000)); break; }
       }
     } catch (e) {}
 
-    // Wait for listings
-    console.log("[SCRAPE] Waiting for listings...");
-    try {
-      await page.waitForFunction(() => {
-        return document.querySelectorAll('a.hfpxzc').length > 0;
-      }, { timeout: 60000 });
-      console.log("[SCRAPE] Listings found!");
-    } catch (err) {
-      throw new Error(`No listings found. Page: "${await page.title()}"`);
-    }
+    await page.waitForSelector('div[role="feed"]', { timeout: 30000 });
 
-    // ===== STEP 2: Scroll to load enough listings =====
-    const totalNeeded = skip + limit;
-    let previousCount = 0;
-    let noNewCount = 0;
+    const processed = new Set();
+    const results = [];
+    let sameCount = 0;
+    let collected = 0;   // Track how many we've collected (for skip/limit)
+    let skipped = 0;     // Track how many we've skipped
 
-    while (noNewCount < 5) {
-      const currentCount = await page.evaluate(() => document.querySelectorAll('a.hfpxzc').length);
-      console.log(`[SCRAPE] Loaded ${currentCount} listings...`);
-      if (currentCount >= totalNeeded) break;
-      if (currentCount === previousCount) noNewCount++;
-      else noNewCount = 0;
-      previousCount = currentCount;
+    while (true) {
+      // Get visible listings - FRESH handles each loop iteration
+      const listings = await page.$$("div.Nv2PK");
 
+      console.log("[SCRAPE] Visible listings:", listings.length);
+
+      let newDataFound = false;
+
+      for (let i = 0; i < listings.length; i++) {
+        if (collected >= limit) break;  // Stop when we have enough
+
+        try {
+          // Get unique name from list (SAME as your local script)
+          const name = await listings[i].evaluate(el =>
+            el.innerText.split("\n")[0]
+          );
+
+          if (processed.has(name)) continue;
+
+          processed.add(name);
+          newDataFound = true;
+
+          // Handle skip
+          if (skipped < skip) {
+            skipped++;
+            console.log(`[SCRAPE] Skipping: ${name} (${skipped}/${skip})`);
+            continue;
+          }
+
+          console.log(`[SCRAPE] [${collected + 1}/${limit}] Processing: ${name}`);
+
+          // Scroll into view (SAME as your local script)
+          await listings[i].evaluate(el =>
+            el.scrollIntoView({ block: "center" })
+          );
+
+          await new Promise(r => setTimeout(r, 1000));
+
+          // Click (SAME as your local script - uses Puppeteer's real click)
+          await listings[i].click();
+
+          await page.waitForSelector("h1", { timeout: 10000 });
+
+          await new Promise(r => setTimeout(r, 2000));
+
+          // Extract data (SAME selectors as your local script)
+          const data = await page.evaluate(() => {
+            const clean = (text) =>
+              text.replace(/[^\x20-\x7E]/g, "").trim();
+
+            const getText = (selector) =>
+              clean(document.querySelector(selector)?.innerText || "");
+
+            const getHref = (selector) =>
+              document.querySelector(selector)?.href || "";
+
+            return {
+              name: getText("h1"),
+              rating: getText('div[role="img"]'),
+              reviews: getText(".F7nice"),
+              address: getText('button[data-item-id="address"]'),
+              phone: getText('button[data-item-id*="phone"]'),
+              website: getHref('a[data-item-id="authority"]'),
+              google_link: window.location.href
+            };
+          });
+
+          console.log(`[SCRAPE] ✅ ${data.name} | ${data.rating} | 📞${data.phone}`);
+
+          results.push(data);
+          collected++;
+
+          // Go back (SAME as your local script)
+          await page.goBack();
+          await page.waitForSelector('div[role="feed"]', { timeout: 15000 });
+
+          await new Promise(r => setTimeout(r, 2000));
+
+        } catch (err) {
+          console.log("[SCRAPE] Error:", err.message);
+          // Try to recover - go back to feed
+          try {
+            await page.goBack().catch(() => {});
+            await page.waitForSelector('div[role="feed"]', { timeout: 10000 }).catch(() => {});
+            await new Promise(r => setTimeout(r, 2000));
+          } catch (e) {}
+        }
+      }
+
+      if (collected >= limit) break;
+
+      // Scroll SMALL step (SAME as your local script)
       await page.evaluate(() => {
         const feed = document.querySelector('div[role="feed"]');
-        if (feed) feed.scrollBy(0, 800);
+        if (feed) feed.scrollBy(0, 500);
       });
+
       await new Promise(r => setTimeout(r, 2000));
-    }
 
-    // ===== STEP 3: Collect listing names + URLs =====
-    const allListings = await page.evaluate(() => {
-      const links = document.querySelectorAll('a.hfpxzc');
-      const results = [];
-      links.forEach(link => {
-        const name = link.getAttribute('aria-label') || '';
-        const href = link.getAttribute('href') || '';
-        if (name && href) results.push({ name, url: href });
-      });
-      return results;
-    });
+      // Stop condition (SAME as your local script)
+      if (!newDataFound) {
+        sameCount++;
+      } else {
+        sameCount = 0;
+      }
 
-    console.log(`[SCRAPE] Found ${allListings.length} listings in feed`);
-
-    // ===== STEP 4: Visit each place URL directly =====
-    const startIndex = skip;
-    const endIndex = Math.min(skip + limit, allListings.length);
-    const finalResults = [];
-
-    for (let i = startIndex; i < endIndex; i++) {
-      const listing = allListings[i];
-      if (!listing) continue;
-
-      console.log(`[SCRAPE] [${finalResults.length + 1}/${limit}] Visiting: ${listing.name}`);
-
-      try {
-        // Navigate to the place URL with a SHORT timeout
-        // If it doesn't load in 20s, we skip it fast instead of waiting 45s
-        await page.goto(listing.url, {
-          waitUntil: "domcontentloaded",
-          timeout: 20000
-        });
-
-        // Wait for h1 (business name)
-        await page.waitForFunction(() => {
-          const h1 = document.querySelector('h1');
-          return h1 && h1.innerText.trim().length > 0 && h1.innerText.trim() !== 'Results';
-        }, { timeout: 8000 }).catch(() => {});
-
-        // Wait for info section (phone/address/website buttons)
-        await page.waitForFunction(() => {
-          return document.querySelectorAll('button[data-item-id], a[data-item-id]').length > 0;
-        }, { timeout: 8000 }).catch(() => {});
-
-        await new Promise(r => setTimeout(r, 1000));
-
-        // Extract data
-        const data = await page.evaluate(() => {
-          const clean = (text) => text ? text.replace(/[^\x20-\x7E]/g, "").trim() : "";
-
-          const h1 = document.querySelector('h1');
-          const name = h1 ? clean(h1.innerText) : '';
-
-          // Rating
-          let rating = '';
-          const ratingSpan = document.querySelector('div.F7nice span[aria-hidden="true"]');
-          if (ratingSpan) rating = clean(ratingSpan.innerText);
-          if (!rating) {
-            for (const s of document.querySelectorAll('span')) {
-              if (/^\d\.\d$/.test(s.innerText.trim())) { rating = s.innerText.trim(); break; }
-            }
-          }
-
-          // Reviews
-          let reviews = '';
-          const reviewBtn = document.querySelector('button[jsaction*="review"][aria-label]');
-          if (reviewBtn) {
-            const m = (reviewBtn.getAttribute('aria-label') || '').match(/([\d,]+)\s*review/i);
-            if (m) reviews = m[1].replace(/,/g, '');
-          }
-          if (!reviews) {
-            for (const el of document.querySelectorAll('div.F7nice span')) {
-              const t = el.innerText.trim();
-              if (/^\(?\d/.test(t) && !/^\d\.\d$/.test(t)) {
-                reviews = t.replace(/[()]/g, '').trim(); break;
-              }
-            }
-          }
-
-          const phoneBtn = document.querySelector('button[data-item-id*="phone"]');
-          const phone = phoneBtn ? clean(phoneBtn.innerText) : '';
-
-          const websiteLink = document.querySelector('a[data-item-id="authority"]');
-          const website = websiteLink ? websiteLink.href : '';
-
-          const addressBtn = document.querySelector('button[data-item-id="address"]');
-          const address = addressBtn ? clean(addressBtn.innerText) : '';
-
-          return { name, rating, reviews, phone, website, address };
-        });
-
-        finalResults.push({
-          name: data.name || listing.name,
-          rating: data.rating || '',
-          reviews: data.reviews || '',
-          phone: data.phone || '',
-          website: data.website || '',
-          address: data.address || '',
-          google_link: listing.url
-        });
-
-        console.log(`[SCRAPE] ✅ ${data.name} | ⭐${data.rating} | 📞${data.phone} | 🌐${data.website ? 'yes' : 'no'}`);
-
-      } catch (err) {
-        console.log(`[SCRAPE] ⏭️ Skipped ${listing.name} (${err.message.substring(0, 40)})`);
-        // Add with whatever we have
-        finalResults.push({
-          name: listing.name, rating: '', reviews: '', phone: '',
-          website: '', address: '', google_link: listing.url
-        });
+      if (sameCount >= 3) {
+        console.log("[SCRAPE] No new data found, stopping...");
+        break;
       }
     }
 
-    console.log(`[SCRAPE] Done! Returning ${finalResults.length} results.`);
+    console.log(`[SCRAPE] DONE! Collected ${results.length} results.`);
     await browser.close();
-    res.json(finalResults);
+    res.json(results);
 
   } catch (error) {
     console.error("[SCRAPE] Fatal error:", error.message);
