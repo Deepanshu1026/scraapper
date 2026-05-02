@@ -14,12 +14,13 @@ app.get("/", (req, res) => {
 app.get("/scrape", async (req, res) => {
   const query = req.query.q;
   const limit = parseInt(req.query.limit) || 10;
+  const skip = parseInt(req.query.skip) || 0;
   
   if (!query) {
     return res.status(400).json({ error: "Please provide a query parameter 'q'" });
   }
 
-  console.log(`Starting scrape for: ${query} (limit: ${limit})`);
+  console.log(`Starting scrape for: ${query} (limit: ${limit}, skip: ${skip})`);
   
   let browser;
   try {
@@ -75,6 +76,13 @@ app.get("/scrape", async (req, res) => {
 
           processed.add(name);
           newDataFound = true;
+          
+          // FAST FORWARD: If we haven't reached the 'skip' amount, don't click, just scroll past it!
+          if (processed.size <= skip) {
+             console.log(`Skipping: ${name} (Fast forwarding to ${skip})`);
+             continue;
+          }
+
           console.log("Processing:", name);
 
           await listings[i].evaluate(el => el.scrollIntoView({ block: "center" }));
@@ -107,7 +115,6 @@ app.get("/scrape", async (req, res) => {
           await new Promise(r => setTimeout(r, 1000));
         } catch (err) {
           console.log("Error processing item:", err.message);
-          // Try to recover by going back if we're stuck in a detail view
           try {
              await page.goBack();
              await page.waitForSelector('div[role="feed"]', { timeout: 5000 });
