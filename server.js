@@ -69,11 +69,13 @@ app.get("/scrape", async (req, res) => {
     // ===== STEP 1: Navigate to Google Maps search =====
     console.log("[SCRAPE] Navigating to Google Maps...");
     await page.goto(`https://www.google.com/maps/search/${encodeURIComponent(query)}?hl=en`, {
-      waitUntil: "domcontentloaded", timeout: 60000
+      waitUntil: "networkidle0",  // Wait until JS finishes executing (0 network connections for 500ms)
+      timeout: 90000              // 90 seconds - generous for Render free tier
     });
 
+    console.log("[SCRAPE] Page loaded. Checking for consent...");
+
     // Handle consent screen
-    await new Promise(r => setTimeout(r, 3000));
     try {
       for (const sel of ['button[aria-label="Accept all"]', 'button[aria-label="Reject all"]', 'form[action*="consent"] button']) {
         const btn = await page.$(sel);
@@ -81,18 +83,36 @@ app.get("/scrape", async (req, res) => {
       }
     } catch (e) {}
 
-    // Wait for the results feed
+    // Wait for the results feed - try multiple selectors since Google Maps layout can vary
     console.log("[SCRAPE] Waiting for results feed...");
-    try {
-      await page.waitForSelector('div[role="feed"]', { timeout: 30000 });
-    } catch (err) {
-      await new Promise(r => setTimeout(r, 5000));
-      try {
-        await page.waitForSelector('div[role="feed"]', { timeout: 15000 });
-      } catch (err2) {
-        const title = await page.title();
-        throw new Error(`Google Maps did not load the results list. Page title: "${title}".`);
+    const feedSelectors = [
+      'div[role="feed"]',
+      'div.Nv2PK',                 // Direct listing card
+      'a.hfpxzc',                  // Listing link
+    ];
+
+    let feedFound = false;
+    for (let attempt = 0; attempt < 3 && !feedFound; attempt++) {
+      for (const sel of feedSelectors) {
+        try {
+          await page.waitForSelector(sel, { timeout: 15000 });
+          console.log(`[SCRAPE] Found results using selector: ${sel}`);
+          feedFound = true;
+          break;
+        } catch (e) {}
       }
+      if (!feedFound) {
+        console.log(`[SCRAPE] Attempt ${attempt + 1}: feed not found, waiting and scrolling...`);
+        // Sometimes the page needs a scroll or interaction to trigger rendering
+        await page.evaluate(() => window.scrollBy(0, 300));
+        await new Promise(r => setTimeout(r, 5000));
+      }
+    }
+
+    if (!feedFound) {
+      const title = await page.title();
+      const bodySnippet = await page.evaluate(() => document.body.innerText.substring(0, 200));
+      throw new Error(`Google Maps did not load the results list. Page title: "${title}". Content: "${bodySnippet}"`);
     }
 
     // ===== STEP 2: Scroll the feed to load enough listings =====
