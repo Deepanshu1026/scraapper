@@ -126,7 +126,7 @@ app.get("/scrape", async (req, res) => {
         const btn = await page.$(sel);
         if (btn) { await btn.click(); await new Promise(r => setTimeout(r, 3000)); break; }
       }
-    } catch (e) {}
+    } catch (e) { }
 
     // Wait for listings
     try {
